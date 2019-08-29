@@ -1,0 +1,1057 @@
+---
+title: "UNEX Course Recommendation Algorithm 19FA"
+author: "Albert Na"
+date: "August 9, 2019"
+output: html_document
+---
+#Note: For all variables that use numeric indexing (i.e [, 21:29]) take precaution that the indices are the same for whatever data you are using and the data that I worked with. 
+
+#This is a User Based Collaborative Filtering algorithm in which the underlying concept is as follows:            Assume Person A likes Grapes and Person B likes Grapes. Assume Person A likes Oranges. Person B is likely to    have similar opinions on Oranges as Person A than some other random persom.                                   Similarly, this algorithm predicts and recommends courses to students based on preference similarities to courses other students took. The following will be an outline of the steps required to get a list of recommended courses for students to take, but since this is just a prototype I built, feel free to implement your own code as well: 
+
+
+#Read in all the libraries and set working directory to whatever folder you are working in (optional)
+```{r}
+#setwd("C:/Users/ana/Desktop/Updates/UNEX Course Recommendation/19FA Recommendations")
+library(data.table)
+library(magrittr)
+library(dplyr)
+library(stringi)
+```
+
+#Pull list of all courses that will be offered in the quarter you are doing recommendations for. In this case, I will be doing recommendations for Fall 19. To pull this list, you will need to go to UNEX Reporting Services (ask Korena for access if you don't have it yet). Go to Advanced Section Search and fill out the filters accordingly: Program Office (all), Quarter Year (Current quarter year), Section Status (final_approved ONLY), Program Format (uncheck Independent Study and Internships, Limited Meeting, One Day, Travel Program, Video Conference) } Double check with Korena on these filters. Note: Might not need to do this step as our data person might just give you the list 
+
+#Read in list of all courses being offered in current quarter and clean data
+```{r}
+#Courses Offered in Fall 2019
+fall2019 <- read.csv("19FA Courses.csv")
+fall2019 <- fall2019[!grepl("Paralegal Training Program", fall2019$Section_Title), ]
+fall2019 <- fall2019[!grepl("Independent Study/Internship - IN0006", fall2019$Instruction_Method), ]
+fall2019 <- fall2019[!(fall2019$Instruction_Method == ""), ]
+fall2019 <- fall2019[!grepl("International Programs", fall2019$Program_Office), ]
+fall2019 <- fall2019[!grepl("Dean's Office", fall2019$Program_Office), ]
+fall2019 <- fall2019[!grepl("Campus Collaboration", fall2019$Program_Office), ]
+fall2019 <- fall2019[, -1]
+
+#Combine discipline and course number
+colnames(fall2019)[1] <- "Discipline"
+f19 <- within(fall2019, Disc.Code.Course.Number <- paste(Discipline, Course_Number, sep = " "))
+
+#All Online Courses Offered in Fall 2019
+onlinef19 <- f19[grepl("Distance Learning", f19$Program_Format), ]
+```
+
+#Reading in student data: 
+# Step 1: There are 3 different lists of data you are going to need to pull (Students that ONLY take online classes, students that only take ground/hybrid courses, and prospects) - You can find the queries for online students and ground students in Sedona under the folder named Albert and look for the reports Course Rec Non-Cert Ground Hybrid and Course Rec Non-Cert Student Online. To pull the list for prospects, you need to go to Marketo and under the Albert Learning folder, click the "prospects pull" program (has a mailbox icon next to it). Hit the smart list tab at the top and all the filters should be created for you and all you need to do is adjust the dates for SFDC Created Date and Destiny Created Date. For all three of the queries, make sure to adjust the date to whichever quarter it currently is and go back 3 years.
+
+# Step 2: While we want to grab students from 3 years back, we want to grab their course data from the last five years, so repeat step 1, but go back 5 years instead of 3 (Don't need to do this for prospects). For this dataset, we want to filter out all the students that aren't a part of the first list, so we end up with data that consists of students that have taken a course in the past 3 years, but we have their course data from the last 5 years. (DOUBLE CHECK WITH KORENA ON THE TIME FRAMES FOR THESE DATA PULLS)
+```{r}
+#EXAMPLE (replace data with your own pulled data):
+
+#Ground/hybrid students (3 years back)
+ground1 <- read.csv("Course Rec Non-Cert Ground Hybrid_6.24.csv")
+
+#Ground/hybrid students (5 years back)
+ground2 <- read.csv("Course Rec Non-Cert Ground Hybrid_7.12.csv")
+
+#Filter out students that are NOT in the first list 
+ground <- ground2[ground2$Student.ID %in% ground1$Student.ID, ]
+ground <- data.table(ground)
+
+#Same thing as above, but with online courses instead of ground/hybrid
+online1 <- read.csv("Course Rec Non-Cert Student Online_6.24.csv")
+online2 <- read.csv("Course Rec Non-Cert Student Online_7.12.csv")
+online <- online2[online2$Student.ID %in% online1$Student.ID, ]
+online <- data.table(online)
+
+#Read in prospects data
+prospects <- read.csv("prospects_pull_Email_Batch_SmartList_1437.csv")
+```
+
+#Data Cleaning: We want to get rid of students in programs that are different from the regular programs offered by UCLA extension + basic data cleaning
+```{r}
+#Exclude PTP, Pathways, Dental Students, Campus Collaboration
+ground <- ground[ground$Program.Area.Name != "Pathway"]
+ground <- ground[ground$Program.Stream.Code...1 != "PS0316" ]
+ground <- ground[!grepl("DENT", ground$Disc.Code.Course.Number), ]
+ground <- ground[ground$Program.Area.Name != "Campus Collaboration"]
+  
+online <- online[online$Program.Area.Name != "Pathway"]
+online <- online[online$Program.Stream.Code...1 != "PS0316" ]
+online <- online[!grepl("DENT", online$Disc.Code.Course.Number), ]
+online <- online[online$Program.Area.Name != "Campus Collaboration"]
+
+#Exclude ROTC and Development
+ground <- ground[ground$PS.1.Name != "ROTC"]
+online <- online[online$PS.1.Name != "ROTC"]
+ground <- ground[!grepl("Development", ground$Department), ]
+online <- online[!grepl("Development", online$Department), ]
+
+#Clean Prospects Data - incomplete data or prospects in paralegal training program 
+prospects <- prospects[!grepl("PA", prospects$Program.Stream.1),]
+prospects <- prospects[prospects$Program.Stream..C. != "PS0316", ]
+prospects <- prospects[prospects$Program.Stream.1 != "PS0316", ]
+
+
+#Create course matrix with rows as students and columns as courses - 1 indicates student has taken course while 0 indicates student has not 
+onlinecourses <- dcast(online, Student.ID ~ Disc.Code.Course.Number, value.var = "Disc.Code.Course.Number", fun.aggregate = length)
+groundcourses <- dcast(ground, Student.ID ~ Disc.Code.Course.Number, value.var = "Disc.Code.Course.Number", fun.aggregate = length)
+```
+
+
+#1. Recommendation Algorithm for Ground-Hybrid Students - most likely you won't have to change anything in here and just have to make sure your data above was read correctly. Run this algorithm to get course recommendations - make sure the variable names are accurate. 
+```{r}
+#Process for creating a score matrix for user based recommendations:
+# Get similarities of course's top X neighbors
+# Choose course and check if student took course
+# Get consumption record of the user of the top X neighbors
+# Calculate score with a formula
+
+############################
+#  Item Based Similarity   # -> similarity of courses to other courses
+############################ 
+groundcourses.df = as.data.frame(groundcourses)
+
+#Drop Student ID column - I changed the dataframe to a matrix because it takes less time computationally to do calculations in a matrix
+groundcourses.ibs = as.matrix(groundcourses.df[,!(names(groundcourses.df) %in% c("Student.ID"))])
+
+#Compute cosine similarity between courses - I vectorized this code using matrix multiplication to make it run faster, but essentially it is a nested for loop to calculate sum(x*y) / (sqrt(sum(x*x)) * sqrt(sum(y*y))) which is how many times one course was taken with another course. For example, if 1000 students take Math 101, and of those 1000 students, 800 also take Math 102, then Math 102 will have a high similarity score to Math 101. On the other hand if of those 1000 students, only 1 takes English 101, then they will have a low similarity score. 
+groundcourses.ibs.similarity.num = t(groundcourses.ibs) %*% groundcourses.ibs
+sq_diag = sqrt(diag(groundcourses.ibs.similarity.num))
+groundcourses.ibs.similarity.denom = sq_diag %*% t(sq_diag)
+groundcourses.ibs.similarity = groundcourses.ibs.similarity.num/groundcourses.ibs.similarity.denom
+
+#Back to dataframe from matrix
+groundcourses.ibs.similarity = as.data.frame(groundcourses.ibs.similarity) %>% 
+  set_rownames(names(groundcourses.df[-1]))
+
+#Item Based Recommendations - sorts the similarity scores in descending order.
+groundcourses.neighbours = matrix(NA, nrow=ncol(groundcourses.ibs.similarity),ncol=11,
+                                  dimnames=list(colnames(groundcourses.ibs.similarity)))
+for(i in 1:ncol(groundcourses.ibs)) {
+groundcourses.neighbours[i,] = groundcourses.ibs.similarity[order(groundcourses.ibs.similarity[,i],decreasing=T),][i] %>% rownames %>% head(n = 11) %>% t
+}
+
+
+#FOR GIANNI: If you want to do recommendations based on just courses WITHOUT the student course data, end the algorithm here and use the variable groundcourses.neighbors --> this is a list of the top 10 neighbors for all courses. If you want to recommend the top 4 courses for each course, just use the first four courses (V1:V4).
+
+############################
+#  User Based Similarity   # -> similarity of students to other students
+############################ 
+
+#Create matrix of student scores to fill in with values
+groundcourses.student.scores = matrix(NA, nrow=nrow(groundcourses.df),ncol=ncol(groundcourses.df)-1,
+                                  dimnames=list((groundcourses.df$Student.ID),colnames(groundcourses.df[-1])))
+#compute student scores
+for (i in 1:ncol(groundcourses.student.scores)){ #loop through courses
+  #Get a course's top 10 neighbours sorted by similarity -> n = 11 because the top course in similarity will always be itself
+  topN = groundcourses.ibs.similarity[order(groundcourses.ibs.similarity[, i], decreasing = T), ][i] %>% 
+    head(11)
+  topN.names = as.character(rownames(topN))
+  topN.similarities = as.numeric(topN[, 1])
+  #Drop the first one because it will always be the same course
+  topN.names = topN.names[-1]
+  topN.similarities = topN.similarities[-1]
+  # We then get the students' course history for those 10 items 
+  topN.studentCourses = groundcourses.df[, topN.names]
+  # Fill the student score matrix
+  groundcourses.student.scores[,i] <- as.matrix(topN.studentCourses) %*% topN[-1,1] / sum(topN[-1,1])
+}
+
+#Make sure courses that are recommended are not courses student already took
+groundcourses.student.scores[groundcourses.ibs != 0] = 0 
+
+#Make sure courses that are recommended are offered in Summer 2019
+groundcourses.student.scores[, colnames(groundcourses.student.scores) %in% f19$Disc.Code.Course.Number == FALSE] = 0
+
+
+# Placeholder matrix of top 4 recommended courses 
+groundcourses.student.scores.holder <- matrix(NA, nrow=nrow(groundcourses.student.scores), ncol= 4, 
+                                         dimnames=list(rownames(groundcourses.student.scores)))
+
+#Top 4 Courses for all students -> List of recommended courses
+for(i in 1:nrow(groundcourses.student.scores)) {
+    groundcourses.student.scores.holder[i,] = groundcourses.student.scores[,order(groundcourses.student.scores[i,], decreasing=T)][i,] %>% head(n=4) %>% names
+}
+
+################# END OF ALGORITHM ####################
+```
+
+#1(continued). Data Manipulation: 
+```{r}
+#View all students with no recommendations - if a course has little data, the algorithm might be unable to find recommendations, or if all the recommendations are for courses not offered in the current quarter, the student will have no recommendations 
+no_rec <- groundcourses.student.scores[rowSums(groundcourses.student.scores, na.rm = TRUE) == 0, ]
+no_rec1 <- as.data.frame(no_rec)
+no_rec1$Student.ID <- rownames(no_rec)
+norec <- no_rec1$Student.ID
+norec <- as.data.frame(norec)
+ground_student_norec <- merge(ground, norec, by.x = "Student.ID", by.y = "norec")
+#write.csv()
+
+#Merge recommendations with student data so that we can get student info with the recommendations 
+groundcourses.student.scores.holder.id <- as.data.frame(groundcourses.student.scores.holder)
+groundcourses.student.scores.holder.id$Student.ID <- rownames(as.data.frame(groundcourses.student.scores.holder))
+ground_rec <- data.table(groundcourses.student.scores.holder.id)
+  #Take students out with no recommendations
+ground_reccomendations <- ground_rec[!(ground_rec$Student.ID %in% norec$norec), ]
+ground$Student.ID <- as.integer(ground$Student.ID)
+ground_reccomendations$Student.ID <- as.integer(ground_reccomendations$Student.ID)
+ground_student_rec <- merge(ground_reccomendations, ground, by = "Student.ID")
+
+#Add Course Titles to Recommendations - To get course titles, go to Sedona and pull for all courses from the past 5 years. Remove all duplicate values and you should end up with a list of all course titles. For an idea of what your query should look like, you can go under the Albert Folder and hit the courseids report.
+id <- read.csv("courseids.csv")
+groundrecs1 <- merge(ground_student_rec, id, by.x = "V1", by.y = "Disc.Code.Course.Number")
+colnames(groundrecs1)[21:22] <- c("Course ID 1", "Course Title 1")
+groundrecs2 <- merge(groundrecs1, id, by.x = "V2", by.y = "Disc.Code.Course.Number")
+colnames(groundrecs2)[23:24]  <- c("Course ID 2", "Course Title 2")
+groundrecs3 <- merge(groundrecs2, id, by.x = "V3", by.y = "Disc.Code.Course.Number")
+colnames(groundrecs3)[25:26]  <- c("Course ID 3", "Course Title 3")
+groundrecs4 <- merge(groundrecs3, id, by.x = "V4", by.y = "Disc.Code.Course.Number")
+colnames(groundrecs4)[27:28] <- c("Course ID 4", "Course Title 4")
+
+#Remove all recommendations with a 0 score value - In our current recommendation list, if a student has less than 4 real recommendations, then the rest of the recommendations will be filled out with the first four alphabetically occurring courses which is NOT what we want. To make sure that all of our recommendations are courses that actually recommendations with scores, we do the following: 
+
+#Find the first four alphabetically occurring courses and make sure that they are courses that are never used as recommendations (column sums are all 0)
+colSums(groundcourses.student.scores[, 1:4])
+
+#Remove all courses (including course titles and course ids) that are recommended with a score value of 0. Make sure that the courses below match with what you found above, if not then substitute values.  
+groundrecs4[, 1:4][groundrecs4[, 1:4] == "A&O SCI XLC 1"] <- ""
+groundrecs4[, 1:4][groundrecs4[, 1:4] == "A&O SCI XLC 103"] <- ""
+groundrecs4[, 1:4][groundrecs4[, 1:4] == "A&O SCI XLC 104"] <- ""
+groundrecs4[, 1:4][groundrecs4[, 1:4] == "A&O SCI XLC 145"] <- ""
+groundrecs4[, 21:28][groundrecs4[, 21:28] == "Climate Change: From Puzzles to Policy"] <- ""
+groundrecs4[, 21:28][groundrecs4[, 21:28] == "Physical Oceanography"] <- ""
+groundrecs4[, 21:28][groundrecs4[, 21:28] == "Fundamentals of Air and Water Pollution"] <- ""
+groundrecs4[, 21:28][groundrecs4[, 21:28] == "Atmospheric Physics: Radiation, Clouds, and Aerosols"] <- ""
+groundrecs4[, 21:28][groundrecs4[, 21:28] == 157598] <- ""
+groundrecs4[, 21:28][groundrecs4[, 21:28] == 163222] <- ""
+groundrecs4[, 21:28][groundrecs4[, 21:28] == 164890] <- ""
+groundrecs4[, 21:28][groundrecs4[, 21:28] == 130084] <- ""
+
+#Replace all NA values with empty string ("")
+groundstudentrec <- replace(as.matrix(groundrecs4), is.na(groundrecs4), "")
+groundstudentrec<- as.data.frame(groundstudentrec)
+
+#Change variable names for consistency (mandatory) and reorder columns (optional)
+groundstudentrecs <- groundstudentrec[, c(5:8, 18, 17, 4:1, 22, 24, 26, 28, 21, 23, 25, 27)]
+colnames(groundstudentrecs)[5:18] <- c("Courses.Taken", "Title.of.Courses.Taken", "Course.Rec.1", "Course.Rec.2", "Course.Rec.3", "Course.Rec.4", "Course.Title.1", "Course.Title.2", "Course.Title.3", "Course.Title.4", "Course.ID.1", "Course.ID.2", "Course.ID.3", "Course.ID.4")
+
+#Series Fixing - Ran into an issue where if students skipped courses in a series (i.e. student places in Math III skipping Math I and Math II) then they would still be recommended courses in a lower series (Math I and Math II) because they technically haven't taken those courses yet. The following code removes recommended courses that are lower in a series of a course that students already took: 
+
+seriesfix <- groundstudentrecs
+#IGNORE WARNING (length condition > 1) ----> code should work as intended
+#loop through all rows
+for(i in 1:nrow(seriesfix)){
+  #if a course that a student already took is a series (contains V in this case)
+  if(grepl("\\b[V]\\b", seriesfix$Title.of.Courses.Taken[i], ignore.case = FALSE) == TRUE){
+    seriescheck <- sub(' V.*', '', seriesfix$Title.of.Courses.Taken[i])
+    #checks if any recommended courses are courses lower in the series (IV, III, II, I) and removes them
+    if(((seriesfix$Course.Title.1[i] == paste(seriescheck, "IV")) == TRUE) | ((seriesfix$Course.Title.1[i] == paste(seriescheck, "III")) == TRUE) | ((seriesfix$Course.Title.1[i] == paste(seriescheck, "II")) == TRUE) | ((seriesfix$Course.Title.1[i] == paste(seriescheck, "I")) == TRUE)){
+      seriesfix$Course.Title.1[i] <- ""
+      seriesfix$Course.Rec.1[i] <- ""
+      seriesfix$Course.ID.1[i] <- ""
+    } else if(((seriesfix$Course.Title.2[i] == paste(seriescheck, "IV")) == TRUE) | ((seriesfix$Course.Title.2[i] == paste(seriescheck, "III")) == TRUE) | ((seriesfix$Course.Title.2[i] == paste(seriescheck, "II")) == TRUE) | ((seriesfix$Course.Title.2 == paste(seriescheck, "I")) == TRUE)){
+      seriesfix$Course.Title.2[i] <- ""
+      seriesfix$Course.Rec.2[i] <- ""
+      seriesfix$Course.ID.2[i] <- ""
+    } else if(((seriesfix$Course.Title.3[i] == paste(seriescheck, "IV")) == TRUE) | ((seriesfix$Course.Title.3[i] == paste(seriescheck, "III")) == TRUE) | ((seriesfix$Course.Title.3[i] == paste(seriescheck, "II")) == TRUE) | ((seriesfix$Course.Title.3[i] == paste(seriescheck, "I")) == TRUE)){
+      seriesfix$Course.Title.3[i] <- ""
+      seriesfix$Course.Rec.3[i] <- ""
+      seriesfix$Course.ID.3[i] <- ""
+    } else if(((seriesfix$Course.Title.4[i] == paste(seriescheck, "IV")) == TRUE) | ((seriesfix$Course.Title.4[i] == paste(seriescheck, "III")) == TRUE) | ((seriesfix$Course.Title.4[i] == paste(seriescheck, "II")) == TRUE) | ((seriesfix$Course.Title.4[i] == paste(seriescheck, "I")) == TRUE)){
+      seriesfix$Course.Title.4[i] <- ""
+      seriesfix$Course.Rec.4[i] <- ""
+      seriesfix$Course.ID.4[i] <- ""
+    }
+  }
+}    
+
+seriesfix <- replace(as.matrix(seriesfix), is.na(seriesfix), "")
+seriesfix <- as.data.frame(seriesfix)
+
+#same as above but for courses with IV
+for(i in 1:nrow(seriesfix)){
+  if(grepl(" IV", seriesfix$Title.of.Courses.Taken[i]) == TRUE){
+    seriescheck <- sub(' IV.*', '', seriesfix$Title.of.Courses.Taken[i])
+    if(((seriesfix$Course.Title.1[i] == paste(seriescheck, "III")) == TRUE) | ((seriesfix$Course.Title.1[i] == paste(seriescheck, "II")) == TRUE) | ((seriesfix$Course.Title.1[i] == paste(seriescheck, "I")) == TRUE)){
+      seriesfix$Course.Title.1[i] <- ""
+      seriesfix$Course.Rec.1[i] <- ""
+      seriesfix$Course.ID.1[i] <- ""
+    } else if(((seriesfix$Course.Title.2[i] == paste(seriescheck, "III")) == TRUE) | ((seriesfix$Course.Title.2[i] == paste(seriescheck, "II")) == TRUE) | ((seriesfix$Course.Title.2 == paste(seriescheck, "I")) == TRUE)){
+      seriesfix$Course.Title.2[i] <- ""
+      seriesfix$Course.Rec.2[i] <- ""
+      seriesfix$Course.ID.2[i] <- ""
+    } else if(((seriesfix$Course.Title.3[i] == paste(seriescheck, "III")) == TRUE) | ((seriesfix$Course.Title.3[i] == paste(seriescheck, "II")) == TRUE) | ((seriesfix$Course.Title.3[i] == paste(seriescheck, "I")) == TRUE)){
+      seriesfix$Course.Title.3[i] <- ""
+      seriesfix$Course.Rec.3[i] <- ""
+      seriesfix$Course.ID.3[i] <- ""
+    } else if(((seriesfix$Course.Title.4[i] == paste(seriescheck, "III")) == TRUE) | ((seriesfix$Course.Title.4[i] == paste(seriescheck, "II")) == TRUE) | ((seriesfix$Course.Title.4[i] == paste(seriescheck, "I")) == TRUE)){
+      seriesfix$Course.Title.4[i] <- ""
+      seriesfix$Course.Rec.4[i] <- ""
+      seriesfix$Course.ID.4[i] <- ""
+    }
+  }
+}
+    
+seriesfix <- replace(as.matrix(seriesfix), is.na(seriesfix), "")
+seriesfix <- as.data.frame(seriesfix)
+
+#same as above but with courses that have III
+for(i in 1:nrow(seriesfix)){
+  if(grepl(" III", seriesfix$Title.of.Courses.Taken[i]) == TRUE){
+    seriescheck <- sub(' III.*', '', seriesfix$Title.of.Courses.Taken[i])
+    if(((seriesfix$Course.Title.1[i] == paste(seriescheck, "II")) == TRUE)| ((seriesfix$Course.Title.1[i] == paste(seriescheck, "I")) == TRUE)){
+      seriesfix$Course.Title.1[i] <- ""
+      seriesfix$Course.ID.1[i] <- ""
+      seriesfix$Course.Rec.1[i] <- ""
+    } else if(((seriesfix$Course.Title.2[i] == paste(seriescheck, "II")) == TRUE)| ((seriesfix$Course.Title.2[i] == paste(seriescheck, "I")) == TRUE)){
+      seriesfix$Course.Title.2[i] <- ""
+      seriesfix$Course.ID.2[i] <- ""
+      seriesfix$Course.Rec.2[i] <- ""
+    } else if(((seriesfix$Course.Title.3[i] == paste(seriescheck, "II")) == TRUE)| ((seriesfix$Course.Title.3[i] == paste(seriescheck, "I")) == TRUE)){
+      seriesfix$Course.Title.3[i] <- ""
+      seriesfix$Course.ID.3[i] <- ""
+      seriesfix$Course.Rec.3[i] <- ""
+    } else if(((seriesfix$Course.Title.4[i] == paste(seriescheck, "II")) == TRUE)| ((seriesfix$Course.Title.4[i] == paste(seriescheck, "I")) == TRUE)){
+      seriesfix$Course.Title.4[i] <- ""
+      seriesfix$Course.ID.4[i] <- ""
+      seriesfix$Course.Rec.4[i] <- ""
+    }
+  }
+}
+
+seriesfix <- replace(as.matrix(seriesfix), is.na(seriesfix), "")
+seriesfix <- as.data.frame(seriesfix)
+
+#same as above but with II
+for(i in 1:nrow(seriesfix)){
+  if(grepl(" II", seriesfix$Title.of.Courses.Taken[i]) == TRUE){
+    seriescheck <- sub(' II.*', '', seriesfix$Title.of.Courses.Taken[i])
+    if((seriesfix$Course.Title.1[i] == paste(seriescheck, "I")) == TRUE){
+      seriesfix$Course.Title.1[i] <- ""
+      seriesfix$Course.ID.1[i] <- ""
+      seriesfix$Course.Rec.1[i] <- ""
+    } else if((seriesfix$Course.Title.2[i] == paste(seriescheck, "I")) == TRUE){
+      seriesfix$Course.Title.2[i] <- ""
+      seriesfix$Course.ID.2[i] <- ""
+      seriesfix$Course.Rec.2[i] <- ""
+    } else if((seriesfix$Course.Title.3[i] == paste(seriescheck, "I")) == TRUE){
+      seriesfix$Course.Title.3[i] <- ""
+      seriesfix$Course.ID.3[i] <- ""
+      seriesfix$Course.Rec.3[i] <- ""
+    } else if((seriesfix$Course.Title.4[i] == paste(seriescheck, "I")) == TRUE){
+      seriesfix$Course.Title.4[i] <- ""
+      seriesfix$Course.ID.4[i] <- ""
+      seriesfix$Course.Rec.4[i] <- ""
+    }
+  }
+}
+
+seriesfix <- replace(as.matrix(seriesfix), is.na(seriesfix), "")
+seriesfix <- as.data.frame(seriesfix)
+
+#Above code only fixes the series issue for one line. In cases where a student takes multiple courses, the following code fixes the series issue for all recommendations and makes the recommendations consistent. If it outputs an Error, ignore the error and check if code worked as intended
+y = 1
+while(y <= 30){
+for(i in 1:nrow(seriesfix)){
+  while((seriesfix$Student.ID[i] == seriesfix$Student.ID[i+1]) == TRUE){
+    if((seriesfix$Course.Title.1[i] != seriesfix$Course.Title.1[i+1]) == TRUE){
+      seriesfix$Course.Title.1[i] <- ""
+      seriesfix$Course.Title.1[i+1] <- ""
+      seriesfix$Course.ID.1[i] <- ""
+      seriesfix$Course.ID.1[i+1] <- ""
+      seriesfix$Course.Rec.1[i] <- ""
+      seriesfix$Course.Rec.1[i+1] <- ""
+    }
+    if((seriesfix$Course.Title.2[i] != seriesfix$Course.Title.2[i+1]) == TRUE){
+      seriesfix$Course.Title.2[i] <- ""
+      seriesfix$Course.Title.2[i+1] <- ""
+      seriesfix$Course.ID.2[i] <- ""
+      seriesfix$Course.ID.2[i+1] <- ""
+      seriesfix$Course.Rec.2[i] <- ""
+      seriesfix$Course.Rec.2[i+1] <- ""
+    }
+    if((seriesfix$Course.Title.3[i] != seriesfix$Course.Title.3[i+1]) == TRUE){
+      seriesfix$Course.Title.3[i] <- ""
+      seriesfix$Course.Title.3[i+1] <- ""
+      seriesfix$Course.ID.3[i] <- ""
+      seriesfix$Course.ID.3[i+1] <- ""
+      seriesfix$Course.Rec.3[i] <- ""
+      seriesfix$Course.Rec.3[i+1] <- ""
+    }
+    if((seriesfix$Course.Title.4[i] != seriesfix$Course.Title.4[i+1]) == TRUE){
+      seriesfix$Course.Title.4[i] <- ""
+      seriesfix$Course.Title.4[i+1] <- ""
+      seriesfix$Course.ID.4[i] <- ""
+      seriesfix$Course.ID.4[i+1] <- ""
+      seriesfix$Course.Rec.4[i] <- ""
+      seriesfix$Course.Rec.4[i+1] <- ""
+    }
+    i = i +1
+  }
+}
+y = y + 1
+}
+
+#Sort recommendations so that I classes are offered before II classes and so on. If there were no recommendations, I set all empty string values to be Zzzzzz so that they would be sorted at the end instead of the beginning
+sorted <- seriesfix
+sorted <- data.frame(lapply(sorted, as.character), stringsAsFactors = FALSE)
+sorted[sorted == ""] <- "Zzzzzzz"
+
+a = 1
+while(a < 20){
+for(i in 1:nrow(sorted)){
+  if((sorted$Course.Title.1[i] > sorted$Course.Title.2[i]) == TRUE){
+    title1 <- sorted$Course.Title.1[i]
+    rec1 <- sorted$Course.Rec.1[i]
+    id1 <- sorted$Course.ID.1[i]
+    sorted$Course.Title.1[i] <- sorted$Course.Title.2[i]
+    sorted$Course.Title.2[i] <- title1
+    sorted$Course.ID.1[i] <- sorted$Course.ID.2[i]
+    sorted$Course.ID.2[i] <- id1
+    sorted$Course.Rec.1[i] <- sorted$Course.Rec.2[i]
+    sorted$Course.Rec.2[i] <- rec1
+  }
+  if((sorted$Course.Title.2[i] > sorted$Course.Title.3[i]) == TRUE){
+    title2 <- sorted$Course.Title.2[i]
+    rec2 <- sorted$Course.Rec.2[i]
+    id2 <- sorted$Course.ID.2[i]
+    sorted$Course.Title.2[i] <- sorted$Course.Title.3[i]
+    sorted$Course.Title.3[i] <- title2
+    sorted$Course.ID.2[i] <- sorted$Course.ID.3[i]
+    sorted$Course.ID.3[i] <- id2
+    sorted$Course.Rec.2[i] <- sorted$Course.Rec.3[i]
+    sorted$Course.Rec.3[i] <- rec2
+  }
+  if((sorted$Course.Title.3[i] > sorted$Course.Title.4[i]) == TRUE){
+    title3 <- sorted$Course.Title.3[i]
+    rec3 <- sorted$Course.Rec.3[i]
+    id3 <- sorted$Course.ID.3[i]
+    sorted$Course.Title.3[i] <- sorted$Course.Title.4[i]
+    sorted$Course.Title.4[i] <- title3
+    sorted$Course.ID.3[i] <- sorted$Course.ID.4[i]
+    sorted$Course.ID.4[i] <- id3
+    sorted$Course.Rec.3[i] <- sorted$Course.Rec.4[i]
+    sorted$Course.Rec.4[i] <- rec3
+  }
+}
+  a = a + 1
+}
+
+#Change all Zzzzzz values back to empty string now that they are properly sorted at the end 
+sorted[sorted == "Zzzzzzz"] <- ""
+
+#Now we have a cleaned list of recommendations. Export this list and send to ALL Marketing managers for review - make changes to recommendations based on what feedback they send you. 
+#write.csv(sorted, "Ground Student Recommendations Updated.csv")
+
+
+#Take Students out that have no recommendations anymore
+recs <- seriesfix[!(seriesfix$Recommendation.1 == ""), ]
+recs<- replace(as.matrix(recs), is.na(recs), "")
+recs <- as.data.frame(recs)
+
+#Updated list of students with no recommendations
+norecs <- anti_join(seriesfix, recs, by = "Student.ID")
+norecs1 <- as.data.frame(norecs$Student.ID)
+colnames(norecs1)[1] <- "norec"
+norecs1$norec <- as.factor(norecs1$norec)
+no_recommendation <- rbind(norec, norecs1)
+ground$Student.ID <- as.integer(ground$Student.ID)
+ground_student_norec <- merge(ground, no_recommendation, by.x = "Student.ID", by.y = "norec")
+
+#Export list of students with no recommendations 
+#write.csv(ground_student_norec, "groundnorecs.csv")
+```
+
+#2. Algorithm for Online Students: Exactly the same as the algorithm for ground students, just use online data 
+```{r}
+#Process for creating a score matrix for user based recommendations:
+# Get similarities of course's top X neighbors
+# Choose course and check if student took course
+# Get consumption record of the user of the top X neighbors
+# Calculate score with a formula
+
+############################
+#  Item Based Similarity   #
+############################ 
+
+onlinecourses.df = as.data.frame(onlinecourses)
+
+#Drop Student ID column 
+onlinecourses.ibs = as.matrix(onlinecourses.df[, !(names(onlinecourses.df) %in% c("Student.ID"))])
+
+#Compute cosine similarity between courses
+onlinecourses.ibs.similarity.num = t(onlinecourses.ibs) %*% onlinecourses.ibs
+sq_diag = sqrt(diag(onlinecourses.ibs.similarity.num))
+onlinecourses.ibs.similarity.denom = sq_diag %*% t(sq_diag)
+onlinecourses.ibs.similarity = onlinecourses.ibs.similarity.num/onlinecourses.ibs.similarity.denom
+
+#Back to Dataframe
+onlinecourses.ibs.similarity = as.data.frame(onlinecourses.ibs.similarity) %>% 
+  set_rownames(names(onlinecourses.df[-1]))
+
+#Item Based Recommendations 
+onlinecourses.neighbours = matrix(NA, nrow=ncol(onlinecourses.ibs.similarity),ncol=11,
+                                  dimnames=list(colnames(onlinecourses.ibs.similarity)))
+for(i in 1:ncol(onlinecourses.ibs)) {
+onlinecourses.neighbours[i,] = onlinecourses.ibs.similarity[order(onlinecourses.ibs.similarity[,i],decreasing=T),][i] %>% rownames %>% head(n = 11) %>% t
+}
+
+############################
+#  User Based Similarity   #
+############################ 
+onlinecourses.student.scores = matrix(NA, nrow=nrow(onlinecourses.df),ncol=ncol(onlinecourses.df)-1,
+                                  dimnames=list((onlinecourses.df$Student.ID),colnames(onlinecourses.df[-1])))
+#compute student scores
+for (i in 1:ncol(onlinecourses.student.scores)){ #loop through courses
+  #Get a course's top 10 neighbours sorted by similarity
+  topN = onlinecourses.ibs.similarity[order(onlinecourses.ibs.similarity[, i], decreasing = T), ][i] %>% 
+    head(11)
+  topN.names = as.character(rownames(topN))
+  topN.similarities = as.numeric(topN[, 1])
+  #Drop the first one because it will always be the same course
+  topN.names = topN.names[-1]
+  topN.similarities = topN.similarities[-1]
+  # We then get the student's course history for those 10 items 
+  topN.studentCourses = onlinecourses.df[, topN.names]
+  # Fill the student score matrix
+  onlinecourses.student.scores[,i] <- as.matrix(topN.studentCourses) %*% topN[-1,1] / sum(topN[-1,1])
+}
+
+#Make sure courses that are recommended are not courses student already took
+onlinecourses.student.scores[onlinecourses.ibs!=0] = 0 
+
+#Make sure courses that are recommended are ONLINE courses offered in Summer 2019
+onlinecourses.student.scores[, colnames(onlinecourses.student.scores) %in% onlinef19$Disc.Code.Course.Number == FALSE] = 0
+
+#Placeholder. Top 15 courses
+onlinecourses.student.scores.holder <- matrix(NA, nrow=nrow(onlinecourses.student.scores), ncol=4, 
+                                         dimnames=list(rownames(onlinecourses.student.scores)))
+#Top 4 courses recommended to students 
+for(i in 1:nrow(onlinecourses.student.scores)) {
+    onlinecourses.student.scores.holder[i,] = onlinecourses.student.scores[, order(onlinecourses.student.scores[i,], decreasing=T)][i,] %>% head(n=4) %>% names
+}
+
+
+#################### END OF ALGORITHM ########################
+```
+
+#2(continued). Online Students Data Manipulation
+```{r}
+#Get all students with no recommendations 
+online_no_rec <- onlinecourses.student.scores[rowSums(onlinecourses.student.scores, na.rm = TRUE) == 0, ]
+online_no_rec1 <- as.data.frame(online_no_rec)
+online_no_rec1$Student.ID <- rownames(online_no_rec)
+onlinenorec <- online_no_rec1$Student.ID
+onlinenorec <- as.data.frame(onlinenorec)
+online_no_rec <- merge(online, onlinenorec, by.x = "Student.ID", by.y = "onlinenorec")
+
+#Merge recommendations with student data 
+onlinecourses.student.scores.holder.id <- as.data.frame(onlinecourses.student.scores.holder)
+onlinecourses.student.scores.holder.id$Student.ID <- rownames(as.data.frame(onlinecourses.student.scores.holder))
+online_rec <- data.table(onlinecourses.student.scores.holder.id)
+  #Take students out with no recommendations
+online_reccomendations <- online_rec[!(online_rec$Student.ID %in% onlinenorec$onlinenorec), ]
+online_reccomendations$Student.ID <- as.integer(online_reccomendations$Student.ID)
+online_student_rec <- merge(online, online_reccomendations, by = "Student.ID")
+
+#Add course titles to all online recommendations
+id <- read.csv("courseids.csv")
+onlinerecs1 <- merge(online_student_rec, id, by.x = "V1", by.y = "Disc.Code.Course.Number")
+colnames(onlinerecs1)[21:22] <- c("Course ID 1", "Course Title 1")
+
+onlinerecs2 <- merge(onlinerecs1, id, by.x = "V2", by.y = "Disc.Code.Course.Number")
+colnames(onlinerecs2)[23:24]  <- c("Course ID 2", "Course Title 2")
+
+onlinerecs3 <- merge(onlinerecs2, id, by.x = "V3", by.y = "Disc.Code.Course.Number")
+colnames(onlinerecs3)[25:26]  <- c("Course ID 3", "Course Title 3")
+
+onlinerecs4 <- merge(onlinerecs3, id, by.x = "V4", by.y = "Disc.Code.Course.Number")
+colnames(onlinerecs4)[27:28] <- c("Course ID 4", "Course Title 4")
+
+#Find the first four alphabetically occurring courses and make sure that they are courses that are never used as recommendations (column sums are all 0)
+colSums(onlinecourses.student.scores[, 1:4])
+
+#Remove all recommendations with a 0 score value (make sure these courses are same as ones found above)
+onlinerecs4[, 1:4][onlinerecs4[, 1:4] == "AM IND X 492.03"] <- ""
+onlinerecs4[, 1:4][onlinerecs4[, 1:4] == "AM IND X 495"] <- ""
+onlinerecs4[, 1:4][onlinerecs4[, 1:4] == "ANTHRO XL 133F"] <- ""
+onlinerecs4[, 1:4][onlinerecs4[, 1:4] == "ANTHRO XL 139M"] <- ""
+onlinerecs4[, 21:28][onlinerecs4[, 21:28] == "Economic Development and Nation Building in Native America"] <- ""
+onlinerecs4[, 21:28][onlinerecs4[, 21:28] == "Protecting Cultural Property in the Biotech Age"] <- ""
+onlinerecs4[, 21:28][onlinerecs4[, 21:28] == "Anthropology of Food"] <- ""
+onlinerecs4[, 21:28][onlinerecs4[, 21:28] == "Selected Topics in Cultural Anthropology: Medical Anthropology"] <- ""
+onlinerecs4[, 21:28][onlinerecs4[, 21:28] == 131536] <- ""
+onlinerecs4[, 21:28][onlinerecs4[, 21:28] == 132304] <- ""
+onlinerecs4[, 21:28][onlinerecs4[, 21:28] == 158120] <- ""
+onlinerecs4[, 21:28][onlinerecs4[, 21:28] == 149309129] <- ""
+
+
+onlinestudentrec <- replace(as.matrix(onlinerecs4), is.na(onlinerecs4), "")
+onlinestudentrec<- data.table(onlinestudentrec)
+
+#Reorder and rename columns for consistency 
+onlinestudentrecs <- onlinestudentrec[, c(5:8, 18, 17, 4:1, 22, 24, 26, 28, 21, 23, 25, 27)]
+colnames(onlinestudentrecs)[5:18] <- c("Courses.Taken", "Title.of.Courses.Taken", "Course.Rec.1", "Course.Rec.2", "Course.Rec.3", "Course.Rec.4", "Course.Title.1", "Course.Title.2", "Course.Title.3", "Course.Title.4", "Course.ID.1", "Course.ID.2", "Course.ID.3", "Course.ID.4")
+
+#Series Fix
+seriesfix <- onlinestudentrecs
+for(i in 1:nrow(seriesfix)){
+  if(grepl("\\b[V]\\b", seriesfix$Title.of.Courses.Taken[i], ignore.case = FALSE) == TRUE){
+    seriescheck <- sub(' V.*', '', seriesfix$Title.of.Courses.Taken[i])
+    if(((seriesfix$Course.Title.1[i] == paste(seriescheck, "IV")) == TRUE) | ((seriesfix$Course.Title.1[i] == paste(seriescheck, "III")) == TRUE) | ((seriesfix$Course.Title.1[i] == paste(seriescheck, "II")) == TRUE) | ((seriesfix$Course.Title.1[i] == paste(seriescheck, "I")) == TRUE)){
+      seriesfix$Course.Title.1[i] <- ""
+      seriesfix$Course.Rec.1[i] <- ""
+      seriesfix$Course.ID.1[i] <- ""
+    } else if(((seriesfix$Course.Title.2[i] == paste(seriescheck, "IV")) == TRUE) | ((seriesfix$Course.Title.2[i] == paste(seriescheck, "III")) == TRUE) | ((seriesfix$Course.Title.2[i] == paste(seriescheck, "II")) == TRUE) | ((seriesfix$Course.Title.2 == paste(seriescheck, "I")) == TRUE)){
+      seriesfix$Course.Title.2[i] <- ""
+      seriesfix$Course.Rec.2[i] <- ""
+      seriesfix$Course.ID.2[i] <- ""
+    } else if(((seriesfix$Course.Title.3[i] == paste(seriescheck, "IV")) == TRUE) | ((seriesfix$Course.Title.3[i] == paste(seriescheck, "III")) == TRUE) | ((seriesfix$Course.Title.3[i] == paste(seriescheck, "II")) == TRUE) | ((seriesfix$Course.Title.3[i] == paste(seriescheck, "I")) == TRUE)){
+      seriesfix$Course.Title.3[i] <- ""
+      seriesfix$Course.Rec.3[i] <- ""
+      seriesfix$Course.ID.3[i] <- ""
+    } else if(((seriesfix$Course.Title.4[i] == paste(seriescheck, "IV")) == TRUE) | ((seriesfix$Course.Title.4[i] == paste(seriescheck, "III")) == TRUE) | ((seriesfix$Course.Title.4[i] == paste(seriescheck, "II")) == TRUE) | ((seriesfix$Course.Title.4[i] == paste(seriescheck, "I")) == TRUE)){
+      seriesfix$Course.Title.4[i] <- ""
+      seriesfix$Course.Rec.4[i] <- ""
+      seriesfix$Course.ID.4[i] <- ""
+    }
+  }
+}    
+
+seriesfix <- replace(as.matrix(seriesfix), is.na(seriesfix), "")
+seriesfix <- as.data.frame(seriesfix)
+
+for(i in 1:nrow(seriesfix)){
+  if(grepl(" IV", seriesfix$Title.of.Courses.Taken[i]) == TRUE){
+    seriescheck <- sub(' IV.*', '', seriesfix$Title.of.Courses.Taken[i])
+    if(((seriesfix$Course.Title.1[i] == paste(seriescheck, "III")) == TRUE) | ((seriesfix$Course.Title.1[i] == paste(seriescheck, "II")) == TRUE) | ((seriesfix$Course.Title.1[i] == paste(seriescheck, "I")) == TRUE)){
+      seriesfix$Course.Title.1[i] <- ""
+      seriesfix$Course.Rec.1[i] <- ""
+      seriesfix$Course.ID.1[i] <- ""
+    } else if(((seriesfix$Course.Title.2[i] == paste(seriescheck, "III")) == TRUE) | ((seriesfix$Course.Title.2[i] == paste(seriescheck, "II")) == TRUE) | ((seriesfix$Course.Title.2 == paste(seriescheck, "I")) == TRUE)){
+      seriesfix$Course.Title.2[i] <- ""
+      seriesfix$Course.Rec.2[i] <- ""
+      seriesfix$Course.ID.2[i] <- ""
+    } else if(((seriesfix$Course.Title.3[i] == paste(seriescheck, "III")) == TRUE) | ((seriesfix$Course.Title.3[i] == paste(seriescheck, "II")) == TRUE) | ((seriesfix$Course.Title.3[i] == paste(seriescheck, "I")) == TRUE)){
+      seriesfix$Course.Title.3[i] <- ""
+      seriesfix$Course.Rec.3[i] <- ""
+      seriesfix$Course.ID.3[i] <- ""
+    } else if(((seriesfix$Course.Title.4[i] == paste(seriescheck, "III")) == TRUE) | ((seriesfix$Course.Title.4[i] == paste(seriescheck, "II")) == TRUE) | ((seriesfix$Course.Title.4[i] == paste(seriescheck, "I")) == TRUE)){
+      seriesfix$Course.Title.4[i] <- ""
+      seriesfix$Course.Rec.4[i] <- ""
+      seriesfix$Course.ID.4[i] <- ""
+    }
+  }
+}
+    
+seriesfix <- replace(as.matrix(seriesfix), is.na(seriesfix), "")
+seriesfix <- as.data.frame(seriesfix)
+
+for(i in 1:nrow(seriesfix)){
+  if(grepl(" III", seriesfix$Title.of.Courses.Taken[i]) == TRUE){
+    seriescheck <- sub(' III.*', '', seriesfix$Title.of.Courses.Taken[i])
+    if(((seriesfix$Course.Title.1[i] == paste(seriescheck, "II")) == TRUE)| ((seriesfix$Course.Title.1[i] == paste(seriescheck, "I")) == TRUE)){
+      seriesfix$Course.Title.1[i] <- ""
+      seriesfix$Course.ID.1[i] <- ""
+      seriesfix$Course.Rec.1[i] <- ""
+    } else if(((seriesfix$Course.Title.2[i] == paste(seriescheck, "II")) == TRUE)| ((seriesfix$Course.Title.2[i] == paste(seriescheck, "I")) == TRUE)){
+      seriesfix$Course.Title.2[i] <- ""
+      seriesfix$Course.ID.2[i] <- ""
+      seriesfix$Course.Rec.2[i] <- ""
+    } else if(((seriesfix$Course.Title.3[i] == paste(seriescheck, "II")) == TRUE)| ((seriesfix$Course.Title.3[i] == paste(seriescheck, "I")) == TRUE)){
+      seriesfix$Course.Title.3[i] <- ""
+      seriesfix$Course.ID.3[i] <- ""
+      seriesfix$Course.Rec.3[i] <- ""
+    } else if(((seriesfix$Course.Title.4[i] == paste(seriescheck, "II")) == TRUE)| ((seriesfix$Course.Title.4[i] == paste(seriescheck, "I")) == TRUE)){
+      seriesfix$Course.Title.4[i] <- ""
+      seriesfix$Course.ID.4[i] <- ""
+      seriesfix$Course.Rec.4[i] <- ""
+    }
+  }
+}
+
+seriesfix <- replace(as.matrix(seriesfix), is.na(seriesfix), "")
+seriesfix <- as.data.frame(seriesfix)
+
+for(i in 1:nrow(seriesfix)){
+  if(grepl(" II", seriesfix$Title.of.Courses.Taken[i]) == TRUE){
+    seriescheck <- sub(' II.*', '', seriesfix$Title.of.Courses.Taken[i])
+    if((seriesfix$Course.Title.1[i] == paste(seriescheck, "I")) == TRUE){
+      seriesfix$Course.Title.1[i] <- ""
+      seriesfix$Course.ID.1[i] <- ""
+      seriesfix$Course.Rec.1[i] <- ""
+    } else if((seriesfix$Course.Title.2[i] == paste(seriescheck, "I")) == TRUE){
+      seriesfix$Course.Title.2[i] <- ""
+      seriesfix$Course.ID.2[i] <- ""
+      seriesfix$Course.Rec.2[i] <- ""
+    } else if((seriesfix$Course.Title.3[i] == paste(seriescheck, "I")) == TRUE){
+      seriesfix$Course.Title.3[i] <- ""
+      seriesfix$Course.ID.3[i] <- ""
+      seriesfix$Course.Rec.3[i] <- ""
+    } else if((seriesfix$Course.Title.4[i] == paste(seriescheck, "I")) == TRUE){
+      seriesfix$Course.Title.4[i] <- ""
+      seriesfix$Course.ID.4[i] <- ""
+      seriesfix$Course.Rec.4[i] <- ""
+    }
+  }
+}
+
+seriesfix <- replace(as.matrix(seriesfix), is.na(seriesfix), "")
+seriesfix <- as.data.frame(seriesfix)
+
+#Make course recs consistent
+y = 1
+while(y <= 30){
+for(i in 1:nrow(seriesfix)){
+  while((seriesfix$Student.ID[i] == seriesfix$Student.ID[i+1]) == TRUE){
+    if((seriesfix$Course.Title.1[i] != seriesfix$Course.Title.1[i+1]) == TRUE){
+      seriesfix$Course.Title.1[i] <- ""
+      seriesfix$Course.Title.1[i+1] <- ""
+      seriesfix$Course.ID.1[i] <- ""
+      seriesfix$Course.ID.1[i+1] <- ""
+      seriesfix$Course.Rec.1[i] <- ""
+      seriesfix$Course.Rec.1[i+1] <- ""
+    }
+    if((seriesfix$Course.Title.2[i] != seriesfix$Course.Title.2[i+1]) == TRUE){
+      seriesfix$Course.Title.2[i] <- ""
+      seriesfix$Course.Title.2[i+1] <- ""
+      seriesfix$Course.ID.2[i] <- ""
+      seriesfix$Course.ID.2[i+1] <- ""
+      seriesfix$Course.Rec.2[i] <- ""
+      seriesfix$Course.Rec.2[i+1] <- ""
+    }
+    if((seriesfix$Course.Title.3[i] != seriesfix$Course.Title.3[i+1]) == TRUE){
+      seriesfix$Course.Title.3[i] <- ""
+      seriesfix$Course.Title.3[i+1] <- ""
+      seriesfix$Course.ID.3[i] <- ""
+      seriesfix$Course.ID.3[i+1] <- ""
+      seriesfix$Course.Rec.3[i] <- ""
+      seriesfix$Course.Rec.3[i+1] <- ""
+    }
+    if((seriesfix$Course.Title.4[i] != seriesfix$Course.Title.4[i+1]) == TRUE){
+      seriesfix$Course.Title.4[i] <- ""
+      seriesfix$Course.Title.4[i+1] <- ""
+      seriesfix$Course.ID.4[i] <- ""
+      seriesfix$Course.ID.4[i+1] <- ""
+      seriesfix$Course.Rec.4[i] <- ""
+      seriesfix$Course.Rec.4[i+1] <- ""
+    }
+    i = i +1
+  }
+}
+y = y + 1
+}
+
+#Sort recommendations so that I classes are offered before II classes and so on
+sorted <- seriesfix
+sorted <- data.frame(lapply(sorted, as.character), stringsAsFactors = FALSE)
+sorted[sorted == ""] <- "Zzzzzzz"
+
+a = 1
+while(a < 20){
+for(i in 1:nrow(sorted)){
+  if((sorted$Course.Title.1[i] > sorted$Course.Title.2[i]) == TRUE){
+    title1 <- sorted$Course.Title.1[i]
+    rec1 <- sorted$Course.Rec.1[i]
+    id1 <- sorted$Course.ID.1[i]
+    sorted$Course.Title.1[i] <- sorted$Course.Title.2[i]
+    sorted$Course.Title.2[i] <- title1
+    sorted$Course.ID.1[i] <- sorted$Course.ID.2[i]
+    sorted$Course.ID.2[i] <- id1
+    sorted$Course.Rec.1[i] <- sorted$Course.Rec.2[i]
+    sorted$Course.Rec.2[i] <- rec1
+  }
+  if((sorted$Course.Title.2[i] > sorted$Course.Title.3[i]) == TRUE){
+    title2 <- sorted$Course.Title.2[i]
+    rec2 <- sorted$Course.Rec.2[i]
+    id2 <- sorted$Course.ID.2[i]
+    sorted$Course.Title.2[i] <- sorted$Course.Title.3[i]
+    sorted$Course.Title.3[i] <- title2
+    sorted$Course.ID.2[i] <- sorted$Course.ID.3[i]
+    sorted$Course.ID.3[i] <- id2
+    sorted$Course.Rec.2[i] <- sorted$Course.Rec.3[i]
+    sorted$Course.Rec.3[i] <- rec2
+  }
+  if((sorted$Course.Title.3[i] > sorted$Course.Title.4[i]) == TRUE){
+    title3 <- sorted$Course.Title.3[i]
+    rec3 <- sorted$Course.Rec.3[i]
+    id3 <- sorted$Course.ID.3[i]
+    sorted$Course.Title.3[i] <- sorted$Course.Title.4[i]
+    sorted$Course.Title.4[i] <- title3
+    sorted$Course.ID.3[i] <- sorted$Course.ID.4[i]
+    sorted$Course.ID.4[i] <- id3
+    sorted$Course.Rec.3[i] <- sorted$Course.Rec.4[i]
+    sorted$Course.Rec.4[i] <- rec3
+  }
+}
+  a = a + 1
+}
+sorted[sorted == "Zzzzzzz"] <- ""
+
+#Export list and send to marketing managers for review - update recommendations based on their feedback. 
+write.csv(sorted, "Online Course Recommendations Updated.csv")
+```
+
+#3. Recommendations for Prospects - For prospect recommendations, we don't need to run any recommendation algorithms, and instead recommend the top four most taken courses within each program stream that a prospect expressed interest in. 
+```{r}
+#Find top courses offered in Summer 19 within each program stream 
+allstudents <- rbind(ground, online)
+allstudents <- allstudents[(allstudents$Disc.Code.Course.Number %in% f19$Disc.Code.Course.Number), ]
+top_ps <- allstudents %>% count(Program.Stream.Code...1, Disc.Code.Course.Number) %>% 
+  arrange(desc(n)) %>% 
+  group_by(Program.Stream.Code...1) %>% 
+  slice(seq_len(4))
+
+#Arrange all prospect program streams into one column - from the prospect data that was pulled, there will be multiple columns for different sources of prospects that we want to push into a single column 
+prospects$Program.Stream..C. <- as.character(prospects$Program.Stream..C.)
+prospects$Program.Stream.1 <- as.character(prospects$Program.Stream.1)
+prospects$Program.Stream.1..event. <- as.character(prospects$Program.Stream.1..event.)
+prospects$Program.Stream.1..info.session. <- as.character(prospects$Program.Stream.1..info.session.)
+prospects[is.na(prospects)] <- ""
+for(i in 1:length(prospects$Program.Stream..C.)){
+  if(prospects$Program.Stream..C.[i] == "" & prospects$Program.Stream.1[i] != ""){
+    prospects$Program.Stream..C.[i] <- prospects$Program.Stream.1[i]
+  }
+  else if(prospects$Program.Stream.1..event.[i] != ""){
+    prospects$Program.Stream..C.[i] <- prospects$Program.Stream.1..event.[i]
+  }
+  else if(prospects$Program.Stream.1..info.session.[i] != ""){
+    prospects$Program.Stream..C.[i] <- prospects$Program.Stream.1..info.session.[i]
+  }
+  else{
+   prospects$Program.Stream..C.[i] <- prospects$Program.Stream..C.[i]
+  }
+}
+prospects <- prospects[, c(1:6)]
+colnames(prospects)[6] <- "Program.Stream.Code...1"
+#Get rid of values that aren't actually program streams 
+prospects <- prospects[prospects$Program.Stream.Code...1 != "", ]
+prospects <- prospects[prospects$Program.Stream.Code...1 != 1, ]
+
+#We want to arrange the recommended courses so that they are in separate columns instead of being stacked under the same column. To do this, I widecasted the data and arranged by the top 4 courses  
+top_psrec <- top_ps[,  c(1:2)]
+top_psrec <- top_psrec[top_psrec$Program.Stream.Code...1 != "", ]
+rec <- data.table(top_psrec)
+p_rec <- dcast(rec, Program.Stream.Code...1 ~ Disc.Code.Course.Number, value.var = "Disc.Code.Course.Number", fun.aggregrate = length)
+p_rec <- as.data.frame(p_rec)
+p_rec1 <- p_rec[-1]
+rownames(p_rec1) <- p_rec$Program.Stream.Code...1
+p_rec1 <- as.matrix(p_rec1)
+p_rec_holder <- matrix(NA, nrow=nrow(p_rec1), ncol = 4, dimnames = list(rownames(p_rec1)))
+for(i in 1:nrow(p_rec1)) {
+    p_rec_holder[i,] = p_rec1[, order(p_rec1[i,], decreasing=T)][i,] %>% head(n=4) %>% names
+}
+
+p_rec_ps <- as.data.frame(p_rec_holder)
+p_rec_ps$Program.Stream.Code...1 <- rownames(as.data.frame(p_rec_holder))
+p_rec_ps <- data.table(p_rec_ps)
+prospectrecs <- merge(prospects, p_rec_ps, by = "Program.Stream.Code...1")
+prospectrecs <- prospectrecs[c(2:6, 1, 7:10)] 
+colnames(prospectrecs)[7:10] <- c("Course Recommendation 1", "Course Recommendation 2", "Course Recommendation 3", "Course Recommendation 4")
+prospectrecs <- prospectrecs %>% arrange(Id)
+
+#Add Course Titles
+prospectrecs1 <- merge(prospectrecs, id, by.x = "Course Recommendation 1", by.y = "Disc.Code.Course.Number")
+colnames(prospectrecs1)[ncol(prospectrecs1)]  <- "Course Title 1"
+colnames(prospectrecs1)[11] <- "Course ID 1"
+prospectrecs2 <- merge(prospectrecs1, id, by.x = "Course Recommendation 2", by.y = "Disc.Code.Course.Number")
+colnames(prospectrecs2)[ncol(prospectrecs2)]  <- "Course Title 2"
+colnames(prospectrecs2)[13] <- "Course ID 2"
+prospectrecs3 <- merge(prospectrecs2, id, by.x = "Course Recommendation 3", by.y = "Disc.Code.Course.Number")
+colnames(prospectrecs3)[ncol(prospectrecs3)]  <- "Course Title 3"
+colnames(prospectrecs3)[15] <- "Course ID 3"
+prospectrecs4 <- merge(prospectrecs3, id, by.x = "Course Recommendation 4", by.y = "Disc.Code.Course.Number")
+colnames(prospectrecs4)[ncol(prospectrecs4)]  <- "Course Title 4"
+colnames(prospectrecs4)[17] <- "Course ID 4"
+
+#Remove all courses that are not recommendations
+for(i in 1:nrow(prospectrecs4)){
+  if(prospectrecs4$Program.Stream.Code...1[i] == "PS0054"){
+    prospectrecs4$Program.Stream.Code...1[i] <- prospectrecs4$Program.Stream.Code...1[i]
+  } else{
+    prospectrecs4[i, ][prospectrecs4[i, ] == "ARCH X 438"] <- NA
+    prospectrecs4[i, ][prospectrecs4[i, ] == "ARCH X 430C"] <- NA
+    prospectrecs4[i, ][prospectrecs4[i, ] == "ARCH X 454A"] <- NA
+    prospectrecs4[i, ][prospectrecs4[i, ] == "Fundamentals of Interior Architecture"] <- NA
+    prospectrecs4[i, ][prospectrecs4[i, ] == "Elements of Design I"] <- NA
+    prospectrecs4[i, ][prospectrecs4[i, ] == "Interior Architecture Studio A"] <- NA
+    prospectrecs4[i, ][prospectrecs4[i, ] == "166606"] <- NA
+    prospectrecs4[i, ][prospectrecs4[i, ] == "166714"] <- NA
+    prospectrecs4[i, ][prospectrecs4[i, ] == "167146"] <- NA
+  }
+}
+
+
+prospectrecs4 <- replace(as.matrix(prospectrecs4), is.na(prospectrecs4), "")
+prospectrecs4 <- as.data.frame(prospectrecs4)
+
+#Get all prospects with no recommendations 
+colnames(prospects)[1] <- "Id"
+prospects$`Id` <- as.character(prospects$`Id`)
+pnorec <- anti_join(prospects, prospectrecs4, by = "Id")
+#write.csv(pnorec, "Prospects No Recommendations.csv")
+
+#Get program stream names - on Sedona, select the columns Program Stream Code - 1 and PS 1 Name under Courses. Check yes in the field where it asks to remove duplicate rows and run the query to get a list of all the names of program streams. Merge 
+pstitles <- read.csv("pstitles.csv")
+pstitleupd <- merge(prospectrecs4, pstitles, by = "Program.Stream.Code...1")
+pstitleupd <- replace(as.matrix(pstitleupd), is.na(pstitleupd), "")
+pstitleupd <- as.data.frame(pstitleupd)
+
+#Sort Recommendations
+sorted <- pstitleupd
+
+#Make column names consistent: At this point, we just want the columns related to student ID, First Name, Last Name, Email, Program Stream, Program Stream Title, Course Recs 1-4, Course Rec Titles 1-4, and Course IDS 1-4
+sorted <- sorted[, c(6:9, 1, 19, 5:2, 12, 14, 16, 18, 11, 13, 15, 17)]
+colnames(sorted)[7:10] <- c("Course.Rec.1", "Course.Rec.2", "Course.Rec.3", "Course.Rec.4")
+colnames(sorted)[11:14] <- c("Course.Title.1", "Course.Title.2", "Course.Title.3", "Course.Title.4")
+colnames(sorted)[15:18] <- c("Course.ID.1", "Course.ID.2", "Course.ID.3", "Course.ID.4")
+
+#Sorting recommendations 
+sorted <- data.frame(lapply(sorted, as.character), stringsAsFactors = FALSE)
+sorted[sorted == ""] <- "Zzzzzzz" 
+
+a = 1
+while(a < 10){
+for(i in 1:nrow(sorted)){
+  if((sorted$Course.Title.1[i] > sorted$Course.Title.2[i]) == TRUE){
+    title1 <- sorted$Course.Title.1[i]
+    rec1 <- sorted$Course.Rec.1[i]
+    id1 <- sorted$Course.ID.1[i]
+    sorted$Course.Title.1[i] <- sorted$Course.Title.2[i]
+    sorted$Course.Title.2[i] <- title1
+    sorted$Course.ID.1[i] <- sorted$Course.ID.2[i]
+    sorted$Course.ID.2[i] <- id1
+    sorted$Course.Rec.1[i] <- sorted$Course.Rec.2[i]
+    sorted$Course.Rec.2[i] <- rec1
+  }
+  if((sorted$Course.Title.2[i] > sorted$Course.Title.3[i]) == TRUE){
+    title2 <- sorted$Course.Title.2[i]
+    rec2 <- sorted$Course.Rec.2[i]
+    id2 <- sorted$Course.ID.2[i]
+    sorted$Course.Title.2[i] <- sorted$Course.Title.3[i]
+    sorted$Course.Title.3[i] <- title2
+    sorted$Course.ID.2[i] <- sorted$Course.ID.3[i]
+    sorted$Course.ID.3[i] <- id2
+    sorted$Course.Rec.2[i] <- sorted$Course.Rec.3[i]
+    sorted$Course.Rec.3[i] <- rec2
+  }
+  if((sorted$Course.Title.3[i] > sorted$Course.Title.4[i]) == TRUE){
+    title3 <- sorted$Course.Title.3[i]
+    rec3 <- sorted$Course.Rec.3[i]
+    id3 <- sorted$Course.ID.3[i]
+    sorted$Course.Title.3[i] <- sorted$Course.Title.4[i]
+    sorted$Course.Title.4[i] <- title3
+    sorted$Course.ID.3[i] <- sorted$Course.ID.4[i]
+    sorted$Course.ID.4[i] <- id3
+    sorted$Course.Rec.3[i] <- sorted$Course.Rec.4[i]
+    sorted$Course.Rec.4[i] <- rec3
+  }
+}
+  a = a + 1
+}
+
+sorted[sorted == "Zzzzzzz"] <- ""
+
+#Send prospect recommendations to marketing managers
+#write.csv(sorted, "Prospect Recommendations Updated.csv")
+```
+
+#4. "Recommendations" for Certificates - For certificates, we don't really do recommendations and instead just list out all the different certificates that students are currently taking. Again, the query is created for you on Sedona under my folder ("Course Rec Cert Students")- just adjust the time frame to go back 5 years from current quarter. Once you download the file, format the certificates in the way that I showed you (file saved in the L drive folder for reference) either manually or you can create your own code to do it for you
+
+#After that, we want to add IDS to the certificates. To get all the certificate IDs, you can go into my folder on Sedona and a query should be built for you labeled as "Cert IDs". 
+```{r}
+certs <- read.csv("certs.csv")
+certstudents <- read.csv("Certificate Students Certificates.csv")
+certs1 <- left_join(certstudents, certs, by = c("Marketing.Title.1" = "Marketing.Title"))
+colnames(certs1)[12] <- "Cert ID 1"
+certs2 <- left_join(certs1, certs, by = c("Marketing.Title.2" = "Marketing.Title"))
+colnames(certs2)[13] <- "Cert ID 2"
+certs3 <- left_join(certs2, certs, by = c("Marketing.Title.3" = "Marketing.Title"))
+colnames(certs3)[14] <- "Cert ID 3"
+certs4 <- left_join(certs3, certs, by = c("Marketing.Title.4" = "Marketing.Title"))
+colnames(certs4)[15] <- "Cert ID 4"
+certs5 <- left_join(certs4, certs, by = c("Marketing.Title.5" = "Marketing.Title"))
+colnames(certs5)[16] <- "Cert ID 5"
+certs6 <- left_join(certs5, certs, by = c("Marketing.Title.6" = "Marketing.Title"))
+colnames(certs6)[17] <- "Cert ID 6"
+certs7 <- left_join(certs6, certs, by = c("Marketing.Title.7" = "Marketing.Title"))
+colnames(certs7)[18] <- "Cert ID 7"
+
+certsupd <- replace(as.matrix(certs7), is.na(certs7), "")
+certsupd <- as.data.frame(certsupd)
+write.csv(certsupd, "Certificate Students Updated.csv")
+```
+
+#Get Course Images and Course URLS - Chrystal should provide you with a list of all the Course Images - double check the list and check to see if it is missing any courses that you are recommending. The rest is just merging between Chrystal's list and your recommendations to add course images and using a paste to add course IDS to the URL to create a course URL. 
+```{r}
+#Ground Students
+courseimages <- read.csv("images final.csv")
+#Read in list of recommendations after making changes based on marketing managers feedback
+marketoground <- read.csv("Ground Student Recommendations Updated.csv")
+marketoground1 <- merge(marketoground, courseimages, by.x = "Course.ID.1", by.y = "Course.ID")
+marketoground2 <- left_join(marketoground1, courseimages, by = c("Course.ID.2" = "Course.ID"))
+marketoground3 <- left_join(marketoground2, courseimages, by = c("Course.ID.3" = "Course.ID"))
+marketoground4 <- left_join(marketoground3, courseimages, by = c("Course.ID.4" = "Course.ID"))
+
+marketoground4$Rec_Course_1_URL <- paste("www.uclaextension.edu/search/publicCourseSearchDetails.do?method=load&courseId=", marketoground4$Course.ID.1, sep = "")
+marketoground4$Rec_Course_2_URL <- paste("www.uclaextension.edu/search/publicCourseSearchDetails.do?method=load&courseId=", marketoground4$Course.ID.2, sep = "")
+marketoground4$Rec_Course_3_URL <- paste("www.uclaextension.edu/search/publicCourseSearchDetails.do?method=load&courseId=", marketoground4$Course.ID.3, sep = "")
+marketoground4$Rec_Course_4_URL <- paste("www.uclaextension.edu/search/publicCourseSearchDetails.do?method=load&courseId=", marketoground4$Course.ID.4, sep = "")
+
+#This is to make sure that no URLS are being added when there are no recommendations 
+marketoground4[marketoground4 == "www.uclaextension.edu/search/publ icCourseSearchDetails.do?method=load&courseId=NA"] <- ""
+
+marketogroundupd <- replace(as.matrix(marketoground4), is.na(marketoground4), "")
+marketogroundupd <- as.data.frame(marketogroundupd)
+
+
+#Online Students
+#Read in list of recommendations after it has been updated via feedback from marketing managers
+marketoonline <- read.csv("Online Course Recommendations Updated.csv")
+marketoonline1 <- merge(marketoonline, courseimages, by.x = "Course.ID.1", by.y = "Course.ID")
+marketoonline2 <- left_join(marketoonline1, courseimages, by = c("Course.ID.2" = "Course.ID"))
+marketoonline3 <- left_join(marketoonline2, courseimages, by = c("Course.ID.3" = "Course.ID"))
+marketoonline4 <- left_join(marketoonline3, courseimages, by = c("Course.ID.4" = "Course.ID"))
+
+marketoonline4$Rec_Course_1_URL <- paste("www.uclaextension.edu/search/publicCourseSearchDetails.do?method=load&courseId=", marketoonline4$Course.ID.1, sep = "")
+marketoonline4$Rec_Course_2_URL <- paste("www.uclaextension.edu/search/publicCourseSearchDetails.do?method=load&courseId=", marketoonline4$Course.ID.2, sep = "")
+marketoonline4$Rec_Course_3_URL <- paste("www.uclaextension.edu/search/publicCourseSearchDetails.do?method=load&courseId=", marketoonline4$Course.ID.3, sep = "")
+marketoonline4$Rec_Course_4_URL <- paste("www.uclaextension.edu/search/publicCourseSearchDetails.do?method=load&courseId=", marketoonline4$Course.ID.4, sep = "")
+
+marketoonline4[marketoonline4 == "www.uclaextension.edu/search/publicCourseSearchDetails.do?method=load&courseId=NA"] <- ""
+
+marketoonlineupd <- replace(as.matrix(marketoonline4), is.na(marketoonline4), "")
+marketoonlineupd <- as.data.frame(marketoonlineupd)
+
+
+#Prospects
+#List of recommendations after feedback from marketing managers 
+marketoprospects <- read.csv("Prospect Recommendations Updated.csv")
+pid <- id[, -3]
+p_id1 <- left_join(marketoprospects, pid, by = c("Course.Rec.1" = "Disc.Code.Course.Number"))
+p_id2 <- left_join(p_id1, pid, by = c("Course.Rec.2" = "Disc.Code.Course.Number"))
+p_id3 <- left_join(p_id2, pid, by = c("Course.Rec.3" = "Disc.Code.Course.Number"))
+p_id4 <- left_join(p_id3, pid, by = c("Course.Rec.4" = "Disc.Code.Course.Number"))
+
+marketoprospects1 <- left_join(p_id4, courseimages, by = c("CourseID.x" = "Course.ID"))
+marketoprospects2 <- left_join(marketoprospects1, courseimages, by = c("CourseID.y" = "Course.ID"))
+marketoprospects3 <- left_join(marketoprospects2, courseimages, by = c("CourseID.x.x" = "Course.ID"))
+marketoprospects4 <- left_join(marketoprospects3, courseimages, by = c("CourseID.y.y" = "Course.ID"))
+
+marketoprospects4$Rec_Course_1_URL <- paste("www.uclaextension.edu/search/publicCourseSearchDetails.do?method=load&courseId=", marketoprospects4$CourseID.x, sep = "")
+marketoprospects4$Rec_Course_2_URL <- paste("www.uclaextension.edu/search/publicCourseSearchDetails.do?method=load&courseId=", marketoprospects4$CourseID.y, sep = "")
+marketoprospects4$Rec_Course_3_URL <- paste("www.uclaextension.edu/search/publicCourseSearchDetails.do?method=load&courseId=", marketoprospects4$CourseID.x.x, sep = "")
+marketoprospects4$Rec_Course_4_URL <- paste("www.uclaextension.edu/search/publicCourseSearchDetails.do?method=load&courseId=", marketoprospects4$CourseID.y.y, sep = "")
+
+marketoprospects4[marketoprospects4 == "www.uclaextension.edu/search/publicCourseSearchDetails.do?method=load&courseId=NA"] <- ""
+
+marketoprospectsupd <- replace(as.matrix(marketoprospects4), is.na(marketoprospects4), "")
+marketoprospectsupd <- as.data.frame(marketoprospectsupd)
+
+#write.csv(marketogroundupd, "Final Ground+Hybrid Recs Marketo.csv")
+#write.csv(marketoonlineupd, "Final Online Recs Marketo.csv")
+#write.csv(no_recs_cs, "Final No Recs CS Marketo.csv")
+#write.csv(prospect_no_recs, "Final No Recs P.csv")
+#write.csv(marketoprospectsupd, "Final Prospect Recs Marketo.csv")
+```
+
