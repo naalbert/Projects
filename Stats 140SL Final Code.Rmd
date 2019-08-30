@@ -1,5 +1,5 @@
 ---
-title: "Stats 140SL Final Code"
+title: "Expedia Market Research Project"
 author: "Albert Na"
 date: "March 11, 2019"
 output: html_document
