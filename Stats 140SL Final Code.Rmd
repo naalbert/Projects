@@ -1,0 +1,184 @@
+---
+title: "Stats 140SL Final Code"
+author: "Albert Na"
+date: "March 11, 2019"
+output: html_document
+---
+#Data Cleaning
+```{r}
+library(readr)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+exped <- read_tsv("data.txt")
+dest <- read_delim("dest.txt", "\t", escape_double = FALSE, trim_ws = TRUE)
+dest <- dest[,1:5]
+
+#Filter to only keep Expedia users booking from USA
+expedia_usa <- exped[exped$user_location_country == "UNITED STATES OF AMERICA",]
+
+#Create a vector of user_ids for people who have booked at least once, then pull only the rows of those particular users
+users_with_booking <- expedia_usa %>% filter(is_booking == 1) %>% select(user_id) %>% unique()
+users_with_booking <- users_with_booking$user_id
+usa_users_booked <- expedia_usa[which(expedia_usa$user_id %in% users_with_booking),]
+
+#Filter to only keep users booking hotels located in USA
+usa_users_domestic <- usa_users_booked %>% filter(hotel_country == "UNITED STATES OF AMERICA")
+
+#Display data frame grouped by user_id and srch_destination_id in arranged order
+new_usa_users_domestic <- usa_users_domestic %>% group_by(user_id) %>% group_by(srch_destination_id) %>% arrange(user_id, srch_destination_id, date_time)
+
+#Create new variables for number of hotels the user looked into and the time spent from the first time they thought about booking to the date they actually booked the hotel
+data <- new_usa_users_domestic %>% group_by(user_id,srch_destination_id) %>% mutate(num_hotels=n(),time_spent=difftime(last(date_time), first(date_time),unit="days")) %>% filter(row_number() == n())
+
+#Check for NAs, and remove those observations
+apply(data, 2, function(x) sum(is.na(x)))
+data <- na.omit(data)
+
+#Create a new variable for time difference between the date they booked and the check in date of their hotel booking
+successful <- data %>% filter(is_booking == 1) %>% mutate(time_advance=difftime(as.POSIXct(srch_ci), date_time,units="days"))
+successful$time_advance <- as.numeric(successful$time_advance)
+successful[successful$time_advance < 0,"time_advance"] <- 0
+
+```
+
+#Exploratory Data Analysis / Visualizations
+```{r}
+#Heavy Researchers, Nonresearchers, Early birds, Last minute groupings
+heavyresearchers <- successful[successful$num_hotels>8,]
+nonresearchers <- successful[successful$num_hotels==1,]
+earlybirds <- successful[successful$time_advance > 14,]
+lastminute <- successful[successful$time_advance==0,]
+
+#Looking at is_mobile and is_package variables for each consumer group
+heavyresearchers[,"is_mobile"] %>% table(dnn=c("Heavy researchers non-mobile versus mobile bookings")) %>% prop.table 
+nonresearchers[,"is_mobile"] %>% table(dnn=c("Non-researchers non-mobile versus mobile bookings")) %>% prop.table
+
+earlybirds[,"is_mobile"] %>% table(dnn=c("Early bookers non-mobile versus mobile bookings")) %>% prop.table
+lastminute[,"is_mobile"] %>% table(dnn=c("Same-day bookers non-mobile versus mobile bookings")) %>% prop.table
+
+earlybirds[,"is_package"] %>% table(dnn=c("Early bookers non-packaged versus packaged bookings")) %>% prop.table
+lastminute[,"is_package"] %>% table(dnn=c("Same-day bookers non-packaged versus packaged bookings")) %>% prop.table
+
+heavyresearchers[,"is_package"] %>% table(dnn=c("Heavy researchers non-packaged versus packaged bookings")) %>% prop.table 
+nonresearchers[,"is_package"] %>% table(dnn=c("Non-researchers non-packaged versus packaged bookings")) %>% prop.table
+
+
+#Histograms for time_spent and time_advance
+ggplot(successful[successful$time_spent<10,], aes(x=as.numeric(time_spent), y=..count../sum(count))) +
+  geom_histogram(fill="#CCCCFF", col="black", binwidth=.5) +
+  theme_minimal() +
+  labs(x="Days between search date and booking date", y="Proportion") +
+  ggtitle("Histogram for time_spent variable")
+
+ggplot(successful, aes(x=as.numeric(time_advance), y=..count../sum(count))) +
+  geom_histogram(fill="#CCCCFF", col="black", binwidth=4) +
+  theme_minimal() +
+  labs(x="Days between booking date and check-in date", y="Proportion") +
+  ggtitle("Histogram for time_advance variable")
+
+#Side by side barplot for the affect of seasonality on hotel prices and number of bookings
+monthbook <- successful
+monthbook$date_time <- as.POSIXct(monthbook$date_time)
+monthbook <- monthbook %>% mutate(month = format(date_time, "%m"))
+monthbook$hist_price_band <- factor(monthbook$hist_price_band, levels = c("VL", "L", "M", "H", "VH"))
+monthbook <- monthbook %>%  group_by(is_booking, month, hist_price_band) %>% summarise(n = n())
+ggplot(monthbook, aes(x = month, y = n, fill = hist_price_band)) + geom_bar(stat='identity', position='dodge') + ggtitle("Affect of Seasonality on Hotel Prices and Bookings for USA ") + theme(plot.title = element_text(hjust = 0.5))
+```
+
+#Heatmaps of US Expedia User Destinations/Locations
+```{r}
+library(usmap)
+all_data <- merge(x=successful,y=dest,by="srch_destination_id",all.x=TRUE)
+successful <- successful[which(duplicated(successful$user_id) == TRUE), ]
+
+#Heat map of US Expedia Users
+usmap <- as.data.frame(successful[,4])
+usmap <- usmap %>% group_by(user_location_region) %>% mutate(hits = n())
+usmap <- usmap[-which(duplicated(usmap$user_location_region)), ]
+
+names(usmap)[1] <- "abbr"
+all_map <- merge(statepop, usmap, by='abbr')
+all_map <- all_map[,c(1,2,3,5)]
+
+plot_usmap(data = all_map, values = "hits", lines = "yellow") + 
+  scale_fill_continuous(name = "Number of Users", label = scales::comma) + 
+  theme(plot.title=element_text(size=18),legend.position = "right", legend.text=element_text(size=10)) + 
+  labs(title="Expedia User Locations in the United States")
+
+#Heat map of US Expedia Traveler Destinations
+all_data <- all_data[-which(duplicated(all_data$user_id) == TRUE), ]
+dest_states <- gsub("^.+?, |, United States of America", "", all_data$srch_destination_name)
+index <- which(gsub("^.+?, |, United States of America", "", all_data$srch_destination_name) %in% 
+  c('Alabama', 'Alaska', 'Arizona', 'Arkansas', 'California', 'Colorado', 'Connecticut', 'Delaware', 
+    'Florida', 'Georgia', 'Hawaii', 'Idaho', 'Illinois', 'Indiana', 'Iowa', 'Kansas', 'Kentucky', 
+    'Louisiana', 'Maine', 'Maryland', 'Massachusetts', 'Michigan', 'Minnesota', 'Mississippi', 
+    'Missouri', 'Montana', 'Nebraska', 'Nevada', 'New Hampshire', 'New Jersey', 'New Mexico', 
+    'New York', 'North Carolina', 'North Dakota', 'Ohio', 'Oklahoma', 'Oregon', 'Pennsylvania', 
+    'Rhode Island', 'South Carolina', 'South Dakota', 'Tennessee', 'Texas', 'Utah', 'Vermont', 
+    'Virginia', 'Washington', 'West Virginia', 'Wisconsin', 'Wyoming') == TRUE)
+
+state_dest <- as.data.frame(dest_states[index])
+names(state_dest)[1] <- "full"
+state_dest <- state_dest %>% group_by(full) %>% mutate(visits = n())
+state_dest <- state_dest[-which(duplicated(state_dest$full)), ]
+state_dest_full <- merge(statepop, state_dest, by='full')
+state_dest_full <- state_dest_full[,c(1,2,3,5)]
+
+plot_usmap(data = state_dest_full, values = "visits", lines = "green") + 
+  scale_fill_continuous(name = "Number of Users", label = scales::comma) + 
+  theme(plot.title=element_text(size=18),legend.position = "right", legend.text=element_text(size=10)) + 
+  labs(title="Expedia User Travel Destinations in the United States")
+
+#Calculating the proportion columns
+prop_state <- as.data.frame(cbind(statepop$fips, statepop$abbr, statepop$full, 
+                                  statepop$pop_2015, all_map$hits, state_dest_full$visits))
+
+prop_state$V4 <- as.numeric(as.character(prop_state$V4))
+prop_state$V5 <- as.numeric(as.character(prop_state$V5))
+prop_state$V6 <- as.numeric(as.character(prop_state$V6))
+
+prop_state$prop_hits <- prop_state$V5/prop_state$V4
+prop_state$prop_visits <- prop_state$V6/prop_state$V4
+names(prop_state)[1] <- "fips"
+names(prop_state)[3] <- "state"
+
+#Making US map using proportion of population
+plot_usmap(data = prop_state, values = "prop_visits", lines = "white") + 
+  scale_fill_continuous(name = "Number of Users", label = scales::comma) + 
+  theme(plot.title=element_text(size=18),legend.position = "right", legend.text=element_text(size=10)) + 
+  labs(title="Expedia User Travel Destinations in the United States as Proportions of Population")
+
+plot_usmap(data = prop_state, values = "prop_hits", lines = "white") + 
+  scale_fill_continuous(name = "Number of Users", label = scales::comma) + 
+  theme(plot.title=element_text(size=18),legend.position = "right", legend.text=element_text(size=10)) + 
+  labs(title="Expedia User Locations in the United States as Proportions of Population")
+
+```
+
+#Conclusions
+```{r}
+#Shows that people actually dont book that far in advance for further destinations
+InAdv <- successful %>% group_by(distance_band) %>% summarise(mean(time_advance))
+InAdv$distance_band[1] <- "Close"
+InAdv$distance_band[2] <- "Far"
+InAdv$distance_band[3] <- "Medium"
+InAdv$distance_band[4] <- "Very Close"
+InAdv$distance_band[5] <- "Very Far"
+target <- c("Very Close", "Close", "Medium", "Far", "Very Far")
+InAdv <- InAdv[match(target, InAdv$distance_band),]
+InAdv <- successful %>% group_by(distance_band) %>% summarise(mean(time_advance))
+InAdv
+
+InAdv1 <- successful %>% group_by(distance_band) %>% summarise(median(time_advance))
+InAdv1$distance_band[1] <- "Close"
+InAdv1$distance_band[2] <- "Far"
+InAdv1$distance_band[3] <- "Medium"
+InAdv1$distance_band[4] <- "Very Close"
+InAdv1$distance_band[5] <- "Very Far"
+target <- c("Very Close", "Close", "Medium", "Far", "Very Far")
+InAdv1 <- InAdv1[match(target, InAdv1$distance_band),]
+InAdv1 <- successful %>% group_by(distance_band) %>% summarise(median(time_advance))
+InAdv1
+```
+
